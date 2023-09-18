@@ -1,0 +1,304 @@
+class PaymentServiceImpl(
+    private val appConfiguration: AppConfiguration,
+    private val sepaDebitExecutionResultRepository: SepaDebitExecutionResultRepository,
+    private val locationServiceClient: LocationServiceClient,
+    private val paymentOptionRepository: PaymentOptionRepository,
+    private val userManagementServiceClient: UserManagementServiceClient,
+    private val invoiceEventsSQSClient: InvoiceEventsSQSClient,
+    private val payOneApiResponseRepository: PayOneApiResponseRepository,
+    private val payOneApiClient: PayOneApiClient,
+    private val saferpayService: SaferpayService,
+    private val transactionHistoryRepository: TransactionHistoryRepository,
+    private val clock: Clock
+) : PaymentService {
+
+    private val logger: Logger = LoggerFactory.getLogger(PaymentServiceImpl::class.java)
+
+    companion object {
+        @Volatile
+        private var instance: PaymentService? = null
+
+        fun getInstance(dm: DependencyManager): PaymentService {
+            if (instance == null) {
+                synchronized(this) {
+                    val appConfiguration = dm.getAppConfiguration()
+                    instance = PaymentServiceImpl(
+                        appConfiguration = appConfiguration,
+                        sepaDebitExecutionResultRepository = dm.getDebitExecutionResultRepository(),
+                        locationServiceClient = dm.getLocationServiceClient(),
+                        userManagementServiceClient = dm.getUserManagementServiceClient(),
+                        paymentOptionRepository = dm.getUserPaymentOptionRepository(),
+                        invoiceEventsSQSClient = dm.getInvoiceEventsSQSClient(),
+                        payOneApiResponseRepository = dm.getPayOneApiResponseRepository(),
+                        payOneApiClient = dm.getPayOneApiClient(),
+                        saferpayService = dm.getSaferpayService(),
+                        transactionHistoryRepository = dm.getTransactionHistoryRepository(),
+                        clock = dm.getClock()
+                    )
+                    return instance!!
+                }
+            }
+            return instance!!
+        }
+    }
+
+    override fun processInvoice(requestId: String, processInvoiceMessageDto: ServiceProcessInvoiceMessageDto) {
+        val paymentOption = paymentOptionRepository.getActive(processInvoiceMessageDto.userId)
+
+        if (paymentOption == null){
+            val updateInvoiceStateMessageDto =
+                ServiceUpdateInvoiceStateCommandDto(
+                    invoiceId = processInvoiceMessageDto.invoiceId,
+                    invoiceType = processInvoiceMessageDto.invoiceType.toString(),
+                    invoiceState = "UNPROCESSED",
+                    transactionId = null
+                )
+
+            invoiceEventsSQSClient.sendUpdateInvoiceStateCommand(serviceUpdateInvoiceStateCommandDto = updateInvoiceStateMessageDto)
+            logger.warn("Error processing invoice ${processInvoiceMessageDto.invoiceId}. No active payment options for user ${processInvoiceMessageDto.userId}")
+            return
+        }
+
+        when (paymentOption.type) {
+            PaymentOptionType.PAYONE_SEPA -> {
+                val result = doExecuteSepaDebit(requestId = requestId, sepaDebitMessageDto = processInvoiceMessageDto)
+
+                sepaDebitExecutionResultRepository.insert(sepaDebitExecutionResult = result, timestamp = clock.instant())
+
+                if (result.invoiceState == "PAYMENT_FAILED")
+                    logger.error("SEPA debit failed: " + result.message)
+
+                val updateInvoiceStateMessageDto =
+                    ServiceUpdateInvoiceStateCommandDto(
+                        invoiceId = result.invoiceId,
+                        invoiceType = result.invoiceType.toString(),
+                        invoiceState = result.invoiceState,
+                        transactionId = result.transactionId
+                    )
+
+                invoiceEventsSQSClient.sendUpdateInvoiceStateCommand(serviceUpdateInvoiceStateCommandDto = updateInvoiceStateMessageDto)
+            }
+
+            PaymentOptionType.SAFERPAY_CARD, PaymentOptionType.SAFERPAY_TWINT -> {
+                val locationId = paymentOption.locationId?: throw CustomException(
+                    notFound.withBody("Location id not found in payment option #${paymentOption.id}")
+                )
+
+                val user = userManagementServiceClient.loadUser(locationId, paymentOption.userId, true)
+                    ?: throw UserNotFoundException(paymentOption.userId)
+
+
+                val projectConfiguration = locationServiceClient.loadLocationById(locationId = locationId)
+
+                val subsidiary = projectConfiguration.subsidiaries
+                    .firstOrNull { it.paymentProvider == PaymentProviderDto.SAFERPAY && it.id == user.subsidiaryId }
+                    ?: throw SubsidiaryNotFoundException("User ${user.id} doesn't have subsidiary assigned or given subsidiary doesn't exist for project ${user.locationId}.")
+
+                val paymentProviderConfiguration: SaferpaySubsidiaryConfig =
+                    subsidiary.paymentConfiguration?.let { objectMapper.readValue(it) } ?: throw CustomException(
+                        notFound.withBody("Could not get payment configuration for subsidiary ${subsidiary.id}")
+                    )
+
+                var authorizeResponse: SaferPayAuthorizeDirectResponseDto? = null
+                var captureResponse: SaferPayTransactionCaptureResponseDto? = null
+                var errorResponse: Exception? = null
+
+                try {
+                    authorizeResponse = saferpayService.authorizeTransaction(
+                        paymentProviderConfiguration,
+                        paymentOption,
+                        processInvoiceMessageDto.amount,
+                        projectConfiguration.currency
+                    )
+                    captureResponse = saferpayService.captureTransaction(paymentProviderConfiguration, authorizeResponse)
+                } catch (e : Exception){
+                    errorResponse = e
+                }
+
+                var saferPayTransactionId = authorizeResponse?.transaction?.id
+                if (errorResponse is BaseSaferpayException){
+                    saferPayTransactionId = errorResponse.body.transactionId
+                }
+
+                val transactionHistoryStatus = if (captureResponse?.status == SaferPayTransactionCaptureResponseDto.Companion.CaptureStatus.CAPTURED){
+                    PaymentTransactionHistory.Status.SUCCESS
+                } else PaymentTransactionHistory.Status.FAILED
+
+                val paymentTransactionHistory = PaymentTransactionHistory(
+                    id = UUID.randomUUID().toString(),
+                    transactionId = saferPayTransactionId,
+                    locationId = locationId,
+                    userId = user.id,
+                    paymentOptionId = paymentOption.id,
+                    paymentOptionType = paymentOption.type,
+                    status = transactionHistoryStatus,
+                    createdAt = clock.instant().toEpochMilli(),
+                    payload = objectMapper.writeValueAsString(
+                        mapOf(
+                            "authorize" to authorizeResponse,
+                            "capture" to captureResponse,
+                            "error" to errorResponse.toString()
+                        )
+                    )
+                )
+
+                transactionHistoryRepository.insert(paymentTransactionHistory)
+
+                //TODO: Need core story for refactor InvoiceService to put all possible statues in integration library DTOs
+                val invoiceState = when (paymentTransactionHistory.status) {
+                    PaymentTransactionHistory.Status.SUCCESS -> "PAYMENT_ISSUED"
+                    PaymentTransactionHistory.Status.FAILED -> "PAYMENT_FAILED"
+                }
+
+                invoiceEventsSQSClient.sendUpdateInvoiceStateCommand(
+                    ServiceUpdateInvoiceStateCommandDto(
+                        invoiceId = processInvoiceMessageDto.invoiceId,
+                        invoiceType = processInvoiceMessageDto.invoiceType.toString(),
+                        invoiceState = invoiceState,
+                        transactionId = saferPayTransactionId
+                    )
+                )
+            }
+        }
+    }
+
+    override fun handleUserDeleteAllPaymentOptions(userId: String, timestamp: Instant, removalTimestamp: Instant) {
+        val paymentOptions = paymentOptionRepository.getPaymentOptions(userId = userId)
+        val paymentOptionsToDelete = paymentOptions.filter { !it.active }
+        paymentOptionsToDelete.forEach { paymentOption ->
+            paymentOptionRepository.delete(
+                paymentOptionId = paymentOption.id,
+                timestamp = timestamp,
+                removalTimestamp = removalTimestamp
+            )
+        }
+
+        // User has to have an active payment option during the removal period for current invoices
+        val activePaymentOptionId = paymentOptions.find { it.active }?.id
+        if (!activePaymentOptionId.isNullOrEmpty()) {
+            paymentOptionRepository.setRemovalTimestampToActivePaymentOption(
+                paymentOptionId = activePaymentOptionId,
+                removalTimestamp = removalTimestamp,
+            )
+        }
+
+        invoiceEventsSQSClient.sendScheduleUserInvoicesMessage(ServiceScheduleUserInvoicesCommandDto(userId))
+    }
+
+    fun doExecuteSepaDebit(
+        requestId: String,
+        sepaDebitMessageDto: ServiceProcessInvoiceMessageDto
+    ): SepaDebitExecutionResult {
+        fun buildSepaDebitExecutionResult(
+            invoiceState: String,
+            paymentOptionId: String? = null,
+            message: String,
+            transactionId: String? = null
+        ) =
+            SepaDebitExecutionResult(
+                id = UUID.randomUUID().toString(),
+                invoiceId = sepaDebitMessageDto.invoiceId,
+                invoiceType = sepaDebitMessageDto.invoiceType,
+                invoiceState = invoiceState,
+                requestId = requestId,
+                locationId = sepaDebitMessageDto.locationId,
+                userId = sepaDebitMessageDto.userId,
+                paymentOptionId = paymentOptionId,
+                timestamp = clock.instant(),
+                message = message,
+                transactionId = transactionId
+            )
+
+        val location = locationServiceClient.loadLocationById(locationId = sepaDebitMessageDto.locationId)
+        val user = userManagementServiceClient.loadUser(
+            locationId = sepaDebitMessageDto.locationId,
+            userId = sepaDebitMessageDto.userId,
+            includeDeleted = true
+        ) ?: return buildSepaDebitExecutionResult(
+            invoiceState = "PAYMENT_FAILED",
+            message = "User ${sepaDebitMessageDto.userId} cannot be found."
+        )
+
+        val subsidiary = location.subsidiaries.find { it.id == user.subsidiaryId }
+        if (subsidiary == null) {
+            return buildSepaDebitExecutionResult(
+                invoiceState = "UNPROCESSED",
+                message = "User ${sepaDebitMessageDto.userId} does not have a subsidiaryId or " +
+                        "it cannot be found in project configuration."
+            )
+        } else if (!isValidPayoneSubsidiary(subsidiary = subsidiary)) {
+            return buildSepaDebitExecutionResult(
+                invoiceState = "UNPROCESSED",
+                message = "User ${sepaDebitMessageDto.userId} has a subsidiary assigned " +
+                        "but it is not enabled or not configured properly."
+            )
+        }
+
+        // User has to have an active payment option.
+        val activePaymentOption =
+            paymentOptionRepository.getActive(sepaDebitMessageDto.userId) ?: return buildSepaDebitExecutionResult(
+                invoiceState = "UNPROCESSED",
+                message = "User ${sepaDebitMessageDto.userId} does not have an active payment option."
+            )
+
+        if (activePaymentOption.payOneUserId == null) {
+            return buildSepaDebitExecutionResult(
+                invoiceState = "UNPROCESSED",
+                message = "the active payment option not configured properly for user ${sepaDebitMessageDto.userId} and has empty payOneUserId"
+            )
+        }
+
+        // Combine Authorization arguments.
+        val sepaAuthorizationArguments = SepaAuthorizationArgumentsWrapper(
+            mode = appConfiguration.payOneMode,
+            merchantId = subsidiary.merchantId,
+            portalId = subsidiary.payOnePortalId!!,
+            key = subsidiary.payOneKey!!,
+            subAccountId = subsidiary.payOneSubAccountId!!,
+            reference = generateReference(requestId),
+            narrativeText = generateStatementText(
+                invoiceType = sepaDebitMessageDto.invoiceType,
+                monthStr = sepaDebitMessageDto.monthStr
+            ),
+            userId = activePaymentOption.payOneUserId!!,
+            amount = calculateAmount(sepaDebitMessageDto.amount)
+        )
+
+        // Try to run Authorization request.
+        val payOneAuthorizationResponse = try {
+            payOneApiClient.runSepaAuthorization(sepaAuthorizationArguments)
+        } catch (e: Exception) {
+            return buildSepaDebitExecutionResult(
+                invoiceState = "PAYMENT_FAILED",
+                paymentOptionId = activePaymentOption.id,
+                message = "PayOne Authorization API Exception: ${e.message}"
+            )
+        }
+
+        val payOneApiResponse = payOneAuthorizationResponse.toPayOneApiResponse(
+            userId = sepaDebitMessageDto.userId,
+            locationId = location.id,
+            paymentOptionId = activePaymentOption.id,
+            sepaAuthorizationArguments = sepaAuthorizationArguments.copy(key = "key")
+        )
+        // Log Authorization response.
+        payOneApiResponseRepository.insert(payOneApiResponse = payOneApiResponse, timestamp = clock.instant())
+
+        // Check if PreAuthorization request was successful.
+        if (!payOneAuthorizationResponse.isApproved()) {
+            val errorMessage = payOneAuthorizationResponse.error?.errorMessage ?: throw error("isApproved is faulty")
+            return buildSepaDebitExecutionResult(
+                invoiceState = "PAYMENT_FAILED",
+                paymentOptionId = activePaymentOption.id,
+                message = "PayOne Authorization API Error: $errorMessage"
+            )
+        }
+
+        return buildSepaDebitExecutionResult(
+            invoiceState = "PAYMENT_ISSUED",
+            paymentOptionId = activePaymentOption.id,
+            message = "PayOne Authorization request succeeded.",
+            transactionId = payOneAuthorizationResponse.txId
+        )
+    }
+}
